@@ -9,6 +9,8 @@ namespace Metaregistrar\DNS {
         public const STATE_PRE_READY = 3;
         public const STATE_READY = -1;
 
+        public const DEFAULT_PORT = 53;
+
         private $header;
         private $rawheader;
         private $rawbuffer;
@@ -74,15 +76,15 @@ namespace Metaregistrar\DNS {
 
         const DEFAULT_TIMEOUT = 60;
 
-        function __construct($logging = false)
+        function __construct($logging = false, int $port = self::DEFAULT_PORT, bool $udp = false)
         {
             if ($logging)
             {
                 $this->enableLogging();
             }
-            $this->port=53;
+            $this->port=$port;
             $this->timeout=self::DEFAULT_TIMEOUT;
-            $this->udp=false;
+            $this->udp=$udp;
             $this->types=new dnsTypes();
             set_error_handler(array($this,'error_handler'));
             $this->writelog("dnsProtocol Class Initialised");
