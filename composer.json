@@ -1,5 +1,5 @@
 {
-  "name": "metaregistrar/php-dns-client",
+  "name": "wkejqb/php-dns-client",
   "description": "A php-only, object-oriented client that is able to read and process DNS records",
   "minimum-stability": "stable",
   "license": "proprietary",
