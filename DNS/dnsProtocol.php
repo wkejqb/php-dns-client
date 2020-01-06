@@ -3,9 +3,18 @@
 namespace Metaregistrar\DNS {
     class dnsProtocol
     {
+        public const STATE_OPEN = 0;
+        public const STATE_AWAITING = 1;
+        public const STATE_AWAITING_TCP = 2;
+        public const STATE_PRE_READY = 3;
+        public const STATE_READY = -1;
+
         private $header;
         private $rawheader;
         private $rawbuffer;
+
+        /** @var string|null */
+        private $returnSize;
         /**
          *
          * @var boolean $logging
@@ -42,6 +51,27 @@ namespace Metaregistrar\DNS {
          */
         protected $types;
 
+        /** @var resource|null */
+        private $socket = null;
+
+        /** @var array|null */
+        private $currentQuery = null;
+
+        /** @var int */
+        private $currentState = 0;
+        /** @var float|null */
+        private $awaitingStarted = null;
+
+        /** @var callable|null */
+        private $cb;
+
+        /** @var string|null */
+        private $requestHeader = null;
+        /** @var int|null */
+        private $requestHeaderSize = null;
+        /** @var int|null */
+        private $requestHeaderSizeBin = null;
+
         const DEFAULT_TIMEOUT = 60;
 
         function __construct($logging = false)
@@ -66,6 +96,14 @@ namespace Metaregistrar\DNS {
             }
         }
 
+        /**
+         * @param int $errno
+         * @param string|null $errstr
+         * @param string|null $errfile
+         * @param int|null $errline
+         * @return bool
+         * @throws dnsException
+         */
         function error_handler($errno = 0, $errstr = null, $errfile = null, $errline = null)
         {
             // If error is suppressed with @, don't throw an exception
@@ -76,6 +114,190 @@ namespace Metaregistrar\DNS {
             throw new dnsException('Found '.$errstr.' in line '.$errline.' of '.$errfile, $errno, null);
         }
 
+        public function clear(): void
+        {
+            $this->socket = null;
+            $this->currentQuery = null;
+        }
+
+        public function poll(): void
+        {
+            switch ($this->currentState) {
+                // we have a socket open
+                case 0:
+                    if ($this->udp)
+                    {
+                        if (!fwrite($this->socket, $this->requestHeader, $this->requestHeaderSize))
+                        {
+                            //throw new dnsException("Failed to write question to socket");
+                            $this->closeWithError("Failed to write question to socket");
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        if (!fwrite($this->socket, $this->requestHeaderSizeBin)) // write the socket
+                        {
+                            //throw new dnsException("Failed to write question length to TCP socket");
+                            $this->closeWithError("Failed to write question length to TCP socket");
+                            return;
+                        }
+                        if (!fwrite($this->socket, $this->requestHeader, $this->requestHeaderSize))
+                        {
+                            //throw new dnsException("Failed to write question to TCP socket");
+                            $this->closeWithError("Failed to write question to TCP socket");
+                            return;
+                        }
+                    }
+
+                    $this->setStateAwaiting();
+
+                    break;
+
+                // waiting for response
+                case self::STATE_AWAITING:
+                    if ($this->udp)
+                    {
+                        $this->rawbuffer = fread($this->socket, 4096);
+                        if (!$this->rawbuffer) // read until the end with UDP
+                        {
+                            if (microtime(true) - $this->awaitingStarted > $this->timeout) {
+                                $this->closeWithError("Failed to read (timeout)");
+                            }
+                            return;
+                        }
+                    } else {
+                        $this->returnSize=fread($this->socket,2);
+                        if (!$this->returnSize)
+                        {
+                            if (microtime(true) - $this->awaitingStarted > $this->timeout) {
+                                $this->closeWithError("empty return");
+                            }
+                            return;
+                        }
+                    }
+                    $this->currentState = self::STATE_AWAITING_TCP;
+                    break;
+                case self::STATE_AWAITING_TCP:
+                    $tmplen=unpack("nlength",$this->returnSize);
+                    $datasize=$tmplen['length'];
+                    //$this->writeLog("TCP Stream Length Limit ".$datasize);
+                    $this->rawbuffer=fread($this->socket,$datasize);
+                    if (!$this->rawbuffer)
+                    {
+                        if (microtime(true) - $this->awaitingStarted > $this->timeout) {
+                            //throw new dnsException("Failed to read data buffer");
+                            $this->closeWithError("Failed to read data buffer");
+                        }
+                        return;
+                    }
+                    fclose($this->socket);
+                    $this->currentState = self::STATE_PRE_READY;
+
+                    break;
+                case self::STATE_PRE_READY:
+                    $response = $this->decodeResponse();
+                    $cb = $this->cb;
+                    $cb($response);
+
+                    break;
+
+                // all ready
+                case -1:
+                    usleep(1000);
+                    break;
+            }
+        }
+
+        /**
+         * @param string $question
+         * @param string $type
+         * @param callable $cb function(?dnsResponse $response)
+         * @throws dnsException
+         */
+        public function QueryAsync(string $question, string $type, callable $cb): void
+        {
+            $typeid=$this->types->GetByName($type);
+            if ($typeid===false)
+            {
+                throw new dnsException("Invalid Query Type ".$type);
+            }
+
+            if ($this->udp)
+            {
+                $host="udp://".$this->server;
+            }
+            else
+            {
+                $host=$this->server;
+            }
+            if (!$this->socket=@fsockopen($host,$this->port,$errno,$errstr,$this->timeout))
+            {
+                throw new dnsException("Failed to open socket to ".$host);
+            }
+
+            stream_set_blocking($this->socket, false);
+
+            // Split Into Labels
+            if (preg_match("/[a-z|A-Z]/",$question)==0) // IP Address
+            {
+                $labeltmp=explode(".",$question);	// reverse ARPA format
+                for ($i=count($labeltmp)-1; $i>=0; $i--)
+                {
+                    $labels[]=$labeltmp[$i];
+                }
+                $labels[]="IN-ADDR";
+                $labels[]="ARPA";
+            }
+            else
+            {
+                $labels=explode(".",$question);
+            }
+            $question_binary="";
+            for ($a=0; $a<count($labels); $a++)
+            {
+                $size=strlen($labels[$a]);
+                $question_binary.=pack("C",$size); // size byte first
+                $question_binary.=$labels[$a]; // then the label
+            }
+            $question_binary.=pack("C",0); // end it off
+
+            $this->writeLog("Question: ".$question." (type=".$type."/".$typeid.")");
+
+            $id=rand(1,255)|(rand(0,255)<<8);	// generate the ID
+
+            // Set standard codes and flags
+            $flags=(0x0100 & 0x0300) | 0x0020; // recursion & queryspecmask | authenticated data
+
+            $opcode=0x0000; // opcode
+
+            // Build the header
+            $header="";
+            $header.=pack("n",$id);
+            $header.=pack("n",$opcode | $flags);
+            $header.=pack("nnnn",1,0,0,0);
+            $header.=$question_binary;
+            $header.=pack("n",$typeid);
+            $header.=pack("n",0x0001); // internet class
+            $headersize=strlen($header);
+            $headersizebin=pack("n",$headersize);
+
+            $this->writeLog("Header Length: ".$headersize." Bytes");
+            #$this->DebugBinary($header);
+
+            if ( ($this->udp) && ($headersize>=512) )
+            {
+                fclose($this->socket);
+                $this->socket = null;
+                throw new dnsException("Question too big for UDP (".$headersize." bytes)");
+            }
+
+            $this->cb = $cb;
+            $this->currentState = self::STATE_OPEN;
+            $this->requestHeader = $header;
+            $this->requestHeaderSize = $headersize;
+            $this->requestHeaderSizeBin = $headersizebin;
+        }
 
         /**
          * @param $question
@@ -331,23 +553,20 @@ namespace Metaregistrar\DNS {
                     # Diffie-Helman
                     return 'dh';
                 case 3:
-                    return 'sha1';
-                case 4:
-                    return 'reserved';
                 case 5:
                     return 'sha1';
+                case 4:
+                case 9:
+                case 11:
+                    return 'reserved';
                 case 6:
                     return 'dsansec3sha1';
                 case 7:
                     return 'rsasha1nsec3';
                 case 8:
                     return 'sha256';
-                case 9:
-                    return 'reserved';
                 case 10:
                     return 'sha512';
-                case 11:
-                    return 'reserved';
                 case 12:
                     return 'gost';
                 case 13:
@@ -397,10 +616,10 @@ namespace Metaregistrar\DNS {
             return $base32;
         }
 
+        /** @noinspection PhpUnused */
         function nsec3hash($qname, $salt=null, $iterations='-')
         {
-            //echo $this->nsec3hash('www.lunetkade.nl', 'AB', 1);
-            $salt = pack('H*' , $salt); //hex2bin() in php 5.4
+            $salt = pack('H*' , $salt);
             $iterations = intval($iterations);
             $toHash='';
 
@@ -410,7 +629,6 @@ namespace Metaregistrar\DNS {
                 $toHash .= chr(strlen($part)).$part;
             }
 
-            //echo bin2hex($toHash.$salt)."\n";
             do
             {
                 $toHash .= $salt;
@@ -419,6 +637,84 @@ namespace Metaregistrar\DNS {
             }
             while ($iterations >= 0);
             return $this->base32encode($toHash);
+        }
+
+        /**
+         * @return dnsResponse
+         */
+        protected function decodeResponse(): ?dnsResponse
+        {
+            $buffersize = strlen($this->rawbuffer);
+            $this->writelog("Read Buffer Size " . $buffersize);
+            if ($buffersize < 12) {
+                //throw new dnsException("DNS query return buffer too small");
+                return null;
+            }
+
+            $this->rawheader = substr($this->rawbuffer, 0, 12); // first 12 bytes is the header
+            $this->rawresponse = substr($this->rawbuffer, 12); // after that the response
+            #$this->DebugBinary($this->rawbuffer);
+            $this->header = unpack("nid/nflags/nqdcount/nancount/nnscount/narcount", $this->rawheader);
+            $flags = sprintf("%016b\n", $this->header['flags']);
+            $response = new dnsResponse();
+
+            $response->setAuthorative($flags[5] == '1');
+            $response->setTruncated($flags[6] == '1');
+            $response->setRecursionRequested($flags[7] == '1');
+            $response->setRecursionAvailable($flags[8] == '1');
+            $response->setAuthenticated($flags[10] == '1');
+            $response->setDnssecAware($flags[11] == '1');
+            $response->setAnswerCount($this->header['ancount']);
+
+            $this->writeLog("Query returned " . $this->header['ancount'] . " Answers");
+
+            // Deal with the header question data
+            if ($this->header['qdcount'] > 0) {
+                $response->setQueryCount($this->header['qdcount']);
+                $this->writeLog("Found " . $this->header['qdcount'] . " questions");
+                $q = '';
+                for ($a = 0; $a < $this->header['qdcount']; $a++) {
+                    $c = 1;
+                    while ($c != 0) {
+                        $c = hexdec(bin2hex($response->ReadResponse($this->rawbuffer, 1)));
+                        $q .= $c;
+                    }
+                    $response->addQuery($q);
+                    $response->ReadResponse($this->rawbuffer, 4);
+                }
+            }
+
+            $this->writeLog("Found " . $this->header['ancount'] . " answer records");
+            $response->setResourceResultCount($this->header['ancount']);
+            for ($a = 0; $a < $this->header['ancount']; $a++) {
+                $response->ReadRecord($this->rawbuffer, dnsResponse::RESULTTYPE_RESOURCE);
+            }
+
+            $this->writeLog("Found " . $this->header['nscount'] . " authorative records");
+            $response->setNameserverResultCount($this->header['nscount']);
+            for ($a = 0; $a < $this->header['nscount']; $a++) {
+                $response->ReadRecord($this->rawbuffer, dnsResponse::RESULTTYPE_NAMESERVER);
+            }
+            $response->setAdditionalResultCount($this->header['arcount']);
+            $this->writeLog("Found " . $this->header['arcount'] . " additional records");
+            for ($a = 0; $a < $this->header['arcount']; $a++) {
+                $response->ReadRecord($this->rawbuffer, dnsResponse::RESULTTYPE_ADDITIONAL);
+            }
+            return $response;
+        }
+
+        protected function closeWithError(string $error): void
+        {
+            fclose($this->socket);
+            $this->currentState = self::STATE_READY;
+            $cb = $this->cb;
+            $cb(null, $error);
+        }
+
+        protected function setStateAwaiting(): void
+        {
+            $this->currentState = self::STATE_AWAITING;
+            $this->awaitingStarted = microtime(true);
         }
 
     }

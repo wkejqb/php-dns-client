@@ -1,2 +1,4 @@
 vendor/*
 !vendor/composer/
+.idea
+root-zones-list.php
