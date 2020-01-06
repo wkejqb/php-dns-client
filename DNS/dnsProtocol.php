@@ -126,7 +126,7 @@ namespace Metaregistrar\DNS {
         {
             switch ($this->currentState) {
                 // we have a socket open
-                case 0:
+                case self::STATE_OPEN:
                     if ($this->udp)
                     {
                         if (!fwrite($this->socket, $this->requestHeader, $this->requestHeaderSize))
@@ -168,6 +168,7 @@ namespace Metaregistrar\DNS {
                             }
                             return;
                         }
+                        $this->currentState = self::STATE_PRE_READY;
                     } else {
                         $this->returnSize=fread($this->socket,2);
                         if (!$this->returnSize)
@@ -177,8 +178,8 @@ namespace Metaregistrar\DNS {
                             }
                             return;
                         }
+                        $this->currentState = self::STATE_AWAITING_TCP;
                     }
-                    $this->currentState = self::STATE_AWAITING_TCP;
                     break;
                 case self::STATE_AWAITING_TCP:
                     $tmplen=unpack("nlength",$this->returnSize);
@@ -200,12 +201,13 @@ namespace Metaregistrar\DNS {
                 case self::STATE_PRE_READY:
                     $response = $this->decodeResponse();
                     $cb = $this->cb;
+                    $this->currentState = self::STATE_READY;
                     $cb($response);
 
                     break;
 
                 // all ready
-                case -1:
+                case self::STATE_READY:
                     usleep(1000);
                     break;
             }
